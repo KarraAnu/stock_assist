@@ -1,0 +1,40 @@
+name: Stock Autopilot (paper)
+
+# MANUAL TRIGGER ONLY — no schedule yet. Run it from the GitHub Actions tab
+# ("Run workflow") or the GitHub mobile app. Add a `schedule:` block later to
+# make it recurring.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # allow committing the run log back to the repo
+
+jobs:
+  run-autopilot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run autopilot (paper)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
+        run: python run_autopilot.py
+
+      - name: Persist the decision log
+        run: |
+          git config user.name "autopilot-bot"
+          git config user.email "autopilot-bot@users.noreply.github.com"
+          mkdir -p data
+          git add -f data/autopilot_log.jsonl run_history.log 2>/dev/null || true
+          git commit -m "autopilot run $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "nothing to commit"
+          git push || echo "push skipped"

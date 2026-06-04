@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Secrets never belong in the repo (kept in the MCP client config / GH secrets)
+*secret*
+*.key
+
+# Runtime data & caches (the autopilot log is force-added by CI to persist)
+data/
+reports/
+decisions.jsonl
+backtest/_cache/
+run_history.log
+
+# Claude Code local settings (contains command history / keys)
+.claude/
