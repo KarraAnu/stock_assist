@@ -18,6 +18,12 @@ from tools.battery import analyze_stocks, read_snapshot
 from tools.common import clear_cache, data_dir
 from tools.discover import compare_baskets, discover_stocks, expand_theme
 from tools.estimates import get_estimates
+from tools.watchtower import (
+    add_tripwire,
+    list_tripwires,
+    remove_tripwire,
+    watchtower_run,
+)
 from tools.filings import get_rpo, get_sec_filings
 from tools.fmp import have_key
 from tools.fundamentals import (
@@ -66,6 +72,11 @@ mcp.tool()(expand_theme)
 mcp.tool()(compare_baskets)
 # v6: forward consensus + estimate-revision momentum
 mcp.tool()(get_estimates)
+# v7: watchtower — tripwire monitoring for journaled decisions
+mcp.tool()(watchtower_run)
+mcp.tool()(add_tripwire)
+mcp.tool()(remove_tripwire)
+mcp.tool()(list_tripwires)
 mcp.tool()(get_market_data)
 mcp.tool()(get_etf_info)
 mcp.tool()(get_ownership)
