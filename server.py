@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from tools.battery import analyze_stocks, read_snapshot
 from tools.common import clear_cache, data_dir
+from tools.discover import compare_baskets, discover_stocks, expand_theme
 from tools.filings import get_rpo, get_sec_filings
 from tools.fmp import have_key
 from tools.fundamentals import (
@@ -58,6 +59,10 @@ mcp = FastMCP("stock-eval")
 # v4: the batch deep battery — the primary tool for multi-name evaluation.
 mcp.tool()(analyze_stocks)
 mcp.tool()(read_snapshot)  # point-in-time recall of archived scorecards
+# v5: discovery — signal-first screens, theme expansion, value-chain lag
+mcp.tool()(discover_stocks)
+mcp.tool()(expand_theme)
+mcp.tool()(compare_baskets)
 mcp.tool()(get_market_data)
 mcp.tool()(get_etf_info)
 mcp.tool()(get_ownership)

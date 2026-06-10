@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from .common import data_dir, normalize_ticker, num, parallel_map
 from .filings import get_rpo
+from .fmp import FMPError, fmp_get
 from .fundamentals import (
     get_financials,
     get_historical_valuation,
@@ -252,9 +253,180 @@ def _analyze_one(ticker: str) -> dict:
                                 f"to ${rpo['latest']['usd_m']:,.0f}M — see "
                                 f"get_rpo for the series")
 
+    spec = _speculative_scorecard(ticker, md, fin, rpo, own, row)
+    if spec:
+        row["speculative"] = spec
+        row["flags"].append(f"speculative profile: {spec['bucket']} — "
+                            f"potential score {spec['potential_score']}/100")
+
     if gaps:
         row["data_gaps"] = gaps
     return row
+
+
+def _speculative_scorecard(ticker: str, md: dict, fin: dict, rpo: dict,
+                           own: dict, row: dict) -> dict | None:
+    """Leading-indicator composite for names that can't be judged on earnings.
+
+    Separates funded-engineering-with-traction from promotion machines using
+    only deterministic inputs (the quantum run's IONQ-vs-RGTI split). The
+    score is a CALIBRATABLE PRIOR, not a verdict: it is archived with every
+    snapshot and linked to journaled decisions, so reviews can test whether
+    high scores actually predicted outcomes. What it cannot see is listed in
+    judgment_inputs — that part stays human/agent work.
+    """
+    stage = (fin.get("company_stage") or {}).get("stage") or ""
+    if not stage or stage.startswith("mature"):
+        return None
+
+    rows_fin = fin.get("annual") or []
+    mcap = md.get("market_cap")
+    runway = ((fin.get("company_stage") or {}).get("cash_runway")) or {}
+    runway_years = runway.get("runway_years")
+    fcf_positive = "positive" in str(runway.get("note", ""))
+    components: dict[str, dict] = {}
+
+    # --- funding (0-25): who survives to their milestones ---
+    if fcf_positive:
+        pts = 25
+    elif runway_years is None:
+        pts = 0
+    elif runway_years >= 5:
+        pts = 25
+    elif runway_years >= 3:
+        pts = 18
+    elif runway_years >= 2:
+        pts = 10
+    elif runway_years >= 1:
+        pts = 5
+    else:
+        pts = 0
+    components["funding"] = {"points": pts, "max": 25,
+                             "runway_years": runway_years,
+                             "fcf_positive": fcf_positive}
+
+    # --- traction (0-30): contracted/realized business vs narrative ---
+    rev_now = rows_fin[0].get("revenue") if rows_fin else None
+    rev_prior = rows_fin[1].get("revenue") if len(rows_fin) > 1 else None
+    rpo_val = (rpo.get("latest") or {}).get("value") if rpo.get("available") else None
+    growth = rpo.get("yoy_growth_pct") if rpo_val else None
+    if growth is None and rev_now and rev_prior and rev_prior > 0:
+        growth = round((rev_now / rev_prior - 1) * 100, 1)
+    traction_base = max(v for v in (rpo_val, rev_now, 0.0) if v is not None)
+    g_pts = (18 if (growth or 0) >= 200 else 15 if (growth or 0) >= 100
+             else 10 if (growth or 0) >= 50 else 5 if (growth or 0) >= 20 else 0)
+    ratio = (traction_base / mcap) if (traction_base and mcap) else 0.0
+    if ratio < 0.005:
+        g_pts = min(g_pts, 3)  # growth on an immaterial base isn't traction
+    s_pts = (12 if ratio >= 0.10 else 8 if ratio >= 0.05
+             else 5 if ratio >= 0.02 else 2 if ratio >= 0.005 else 0)
+    components["traction"] = {
+        "points": g_pts + s_pts, "max": 30,
+        "base_usd_m": round(traction_base / 1e6, 1) if traction_base else 0,
+        "base_source": "RPO" if rpo_val else "revenue (FY)",
+        "growth_pct": growth,
+        "base_vs_mcap_pct": round(ratio * 100, 2) if mcap else None,
+    }
+
+    # --- dilution efficiency (0-15): what shareholders got for the shares ---
+    sh_now = rows_fin[0].get("diluted_shares") if rows_fin else None
+    sh_old = rows_fin[-1].get("diluted_shares") if len(rows_fin) > 1 else None
+    dilution_pct = (round((sh_now / sh_old - 1) * 100, 1)
+                    if (sh_now and sh_old and sh_old > 0) else None)
+    if growth is not None and dilution_pct is not None:
+        net = growth - dilution_pct
+        pts = (15 if net >= 100 else 10 if net >= 50 else 6 if net >= 0
+               else 3 if net >= -25 else 0)
+    else:
+        net, pts = None, 0
+    components["dilution_efficiency"] = {
+        "points": pts, "max": 15, "dilution_pct_window": dilution_pct,
+        "traction_growth_minus_dilution_pct": net,
+        "note": "IONQ-vs-RGTI tell: dilution that buys backlog vs dilution "
+                "that buys nothing",
+    }
+
+    # --- R&D intensity (0-10): engineering shop vs promotion shop ---
+    rnd_share = None
+    try:
+        inc = fmp_get("income-statement", symbol=ticker, period="annual", limit=5)
+        if inc:
+            rnd = num(inc[0].get("researchAndDevelopmentExpenses"))
+            opex = num(inc[0].get("operatingExpenses"))
+            if rnd is not None and opex and opex > 0:
+                rnd_share = round(rnd / opex, 2)
+    except FMPError:
+        pass
+    pts = (10 if (rnd_share or 0) >= 0.5 else 6 if (rnd_share or 0) >= 0.3
+           else 3 if (rnd_share or 0) >= 0.15 else 0)
+    components["rnd_intensity"] = {"points": pts, "max": 10,
+                                   "rnd_share_of_opex": rnd_share}
+
+    # --- smart money (0-10) ---
+    insider_net = ((own.get("insider_activity") or {}).get("net_value")
+                   if (own.get("insider_activity") or {}).get("available") else None)
+    inst_pct = (own.get("holders") or {}).get("institutional_pct")
+    pts = (4 if (insider_net or 0) > 0 else 2 if insider_net == 0 else 0)
+    pts += (6 if (inst_pct or 0) >= 60 else 4 if (inst_pct or 0) >= 40
+            else 2 if (inst_pct or 0) >= 20 else 0)
+    components["smart_money"] = {"points": pts, "max": 10,
+                                 "insider_net_6m_usd": insider_net,
+                                 "institutional_pct": inst_pct}
+
+    # --- asymmetry (0-10): beaten-down only counts if funded to recover ---
+    off_high = row.get("pct_off_52w_high")
+    funded = fcf_positive or (runway_years or 0) >= 2
+    if funded and off_high is not None:
+        pts = (10 if off_high <= -60 else 7 if off_high <= -40
+               else 4 if off_high <= -20 else 1)
+    else:
+        pts = 0
+    components["asymmetry"] = {"points": pts, "max": 10,
+                               "pct_off_52w_high": off_high,
+                               "funded_to_recover": funded}
+
+    score = sum(c["points"] for c in components.values())
+    bucket = ("TRACTION-SPEC (funded engineering with contracted traction)"
+              if score >= 60 else
+              "DEVELOPING (some legs, watch the next two quarters)"
+              if score >= 35 else
+              "STORY-SPEC (promotion-shaped — burden of proof on the narrative)")
+
+    # Reverse breakeven: years of growth before today's cap is a normal
+    # growth multiple (8x sales) — replaces reverse-DCF where FCF is negative.
+    breakeven = None
+    if mcap and traction_base and traction_base > 1_000_000:
+        import math
+        target = mcap / 8.0
+        if target > traction_base:
+            breakeven = {
+                "at_40pct_growth": round(math.log(target / traction_base)
+                                         / math.log(1.4), 1),
+                "at_100pct_growth": round(math.log(target / traction_base)
+                                          / math.log(2.0), 1),
+                "note": f"years for {components['traction']['base_source']} to "
+                        f"grow into 8x sales at today's cap",
+            }
+        else:
+            breakeven = {"note": "already at/under 8x the traction base"}
+    elif mcap:
+        breakeven = {"note": "no meaningful traction base — the cap is "
+                             "entirely narrative"}
+
+    return {
+        "potential_score": score,
+        "max_score": 100,
+        "bucket": bucket,
+        "components": components,
+        "reverse_breakeven_years": breakeven,
+        "judgment_inputs": ["milestone credibility & timing",
+                            "technology moat vs alternatives",
+                            "team execution record",
+                            "competitive & funding landscape"],
+        "calibration_note": "a prior, not a verdict — archived in snapshots "
+                            "and linked to journaled decisions so reviews can "
+                            "test whether it predicted outcomes",
+    }
 
 
 def analyze_stocks(tickers) -> dict:
