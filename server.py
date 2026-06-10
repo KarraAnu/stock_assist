@@ -18,6 +18,8 @@ from tools.battery import analyze_stocks, read_snapshot
 from tools.common import clear_cache, data_dir
 from tools.discover import compare_baskets, discover_stocks, expand_theme
 from tools.estimates import get_estimates
+from tools.portfolio import portfolio_report, set_holdings
+from tools.review import pending_reviews, review_dossier
 from tools.watchtower import (
     add_tripwire,
     list_tripwires,
@@ -77,6 +79,11 @@ mcp.tool()(watchtower_run)
 mcp.tool()(add_tripwire)
 mcp.tool()(remove_tripwire)
 mcp.tool()(list_tripwires)
+# v7: review machinery + portfolio layer
+mcp.tool()(pending_reviews)
+mcp.tool()(review_dossier)
+mcp.tool()(set_holdings)
+mcp.tool()(portfolio_report)
 mcp.tool()(get_market_data)
 mcp.tool()(get_etf_info)
 mcp.tool()(get_ownership)
