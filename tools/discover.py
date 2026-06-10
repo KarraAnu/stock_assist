@@ -76,6 +76,13 @@ def _brief(md: dict, reason: str) -> dict:
     growth = md.get("growth", {}).get("revenue")
     fcf = md.get("balance_sheet", {}).get("free_cash_flow")
     mcap = md.get("market_cap")
+    # Same plausibility gate as screen_stocks: out-of-range FCF yields are
+    # data artifacts (foreign-currency financials vs USD cap — UMC/PAYP), and
+    # must not rank a name.
+    if fcf and mcap:
+        fy = fcf / mcap * 100
+        if not (-100 <= fy <= 45):
+            fcf = None
     return {
         "ticker": md.get("ticker"),
         "name": md.get("name"),
