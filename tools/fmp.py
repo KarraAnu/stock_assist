@@ -11,9 +11,14 @@ import os
 
 import requests
 
-from .common import _cached
+from .common import TTL_FMP_STATEMENTS, TTL_FMP_VOLATILE, cached
 
 _BASE = "https://financialmodelingprep.com/stable"
+
+# Endpoints whose payloads move intraday/daily; everything else (statements,
+# ratios, profile, peers, scores) changes quarterly and gets the long TTL.
+_VOLATILE_PATHS = ("company-screener", "ipos-calendar", "insider-trading",
+                   "quote")
 
 
 class FMPError(Exception):
@@ -29,10 +34,12 @@ def have_key() -> bool:
 
 
 def fmp_get(path: str, **params) -> list | dict:
-    """GET an FMP /stable endpoint, cached for 60s. Raises FMPError on failure.
+    """GET an FMP /stable endpoint, cached (disk-backed). Raises FMPError on failure.
 
     `path` is the endpoint name (e.g. "ratios"). `params` are query params
-    excluding the API key, which is injected here.
+    excluding the API key, which is injected here. Financial statements and
+    ratios are cached 24h (they change quarterly); screener/calendar/insider
+    endpoints 1h.
     """
     key = api_key()
     if not key:
@@ -53,4 +60,6 @@ def fmp_get(path: str, **params) -> list | dict:
             raise FMPError(f"FMP {path}: {data['Error Message']}")
         return data
 
-    return _cached(cache_key, produce)
+    ttl = (TTL_FMP_VOLATILE if any(path.startswith(p) for p in _VOLATILE_PATHS)
+           else TTL_FMP_STATEMENTS)
+    return cached(cache_key, produce, ttl=ttl, disk=True)

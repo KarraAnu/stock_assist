@@ -7,7 +7,6 @@ import pandas as pd
 
 from .common import (
     get_history,
-    get_info,
     missing_data_error,
     normalize_ticker,
     num,
@@ -161,48 +160,6 @@ def get_indicators(ticker: str, period: str = "2y") -> dict:
     return result
 
 
-def get_valuation_context(ticker: str) -> dict:
-    """Current valuation multiples for a single stock (v1: current only).
-
-    Returns forward P/E, trailing P/E, and price-to-sales (TTM) as reported by
-    the data provider.
-
-    SCOPE NOTE: this is deliberately CURRENT-multiples-only. It does NOT compare
-    against the stock's own historical multiple range, because that requires a
-    fundamentals time series the free data source can't supply reliably
-    (reconstructing P/E from a handful of sparse quarterly points produces
-    misleadingly thin results). Peer/sector-median comparison is likewise out of
-    scope for v1. The "method" field states this explicitly so the output is not
-    mistaken for historical-relative valuation.
-    """
-    ticker = normalize_ticker(ticker)
-    if not ticker:
-        return {"error": "no ticker provided"}
-
-    info = get_info(ticker)
-    multiples = {
-        "forward_pe": num(info.get("forwardPE")),
-        "trailing_pe": num(info.get("trailingPE")),
-        "price_to_sales_ttm": num(info.get("priceToSalesTrailing12Months")),
-    }
-
-    if all(v is None for v in multiples.values()):
-        return missing_data_error(ticker, ["forward_pe", "trailing_pe",
-                                            "price_to_sales_ttm"],
-                                  partial={"sector": info.get("sector")})
-
-    flags = []
-    ps = multiples["price_to_sales_ttm"]
-    if ps is not None and ps > 50:
-        flags.append("P/S > 50 — revenue is immaterial relative to market cap; "
-                     "P/S is not meaningful here (likely pre-revenue/story stock)")
-
-    return {
-        "ticker": ticker,
-        "sector": info.get("sector"),
-        "industry": info.get("industry"),
-        "multiples": multiples,
-        "flags": flags,
-        "method": "current multiples only; no historical-range or peer "
-                  "comparison in v1 (see tool docstring)",
-    }
+# get_valuation_context was removed in v4: it reported a third, unlabeled P/E
+# basis that contradicted the canonical bases in tools/core.py. Use
+# get_market_data (basis-labeled) or get_historical_valuation instead.

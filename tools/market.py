@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 
 import yfinance as yf
 
 from .common import (
+    get_dividends_raw,
+    get_earnings_dates_raw,
     get_fast_info,
+    get_history,
     get_info,
     get_news_raw,
     missing_data_error,
@@ -41,6 +45,16 @@ def get_market_data(ticker: str) -> dict:
 
     info = get_info(ticker)
     fast = get_fast_info(ticker)
+
+    # ETFs/funds have no market cap or margins — the old code hard-errored on
+    # them (NUKZ/NLR/URA in dogfooding). Route to the fund-shaped payload
+    # instead of failing.
+    if info.get("quoteType") in ("ETF", "MUTUALFUND"):
+        etf = get_etf_info(ticker)
+        etf["note"] = (f"{ticker} is a fund, not a single stock — returning "
+                       f"get_etf_info payload (stock fields like margins/market "
+                       f"cap don't apply)")
+        return etf
 
     info_price = num(info.get("currentPrice")) or num(info.get("regularMarketPrice"))
     fast_price = num(fast.get("last_price"))
@@ -89,6 +103,9 @@ def get_market_data(ticker: str) -> dict:
             "trailing_pe": num(info.get("trailingPE")),
             "price_to_sales_ttm": num(info.get("priceToSalesTrailing12Months")),
             "price_to_book": num(info.get("priceToBook")),
+            "basis": "live price; trailing_pe = TTM EPS incl. one-time items "
+                     "(for the normalized basis see get_historical_valuation "
+                     "or analyze_stocks)",
         },
         "dividend_yield": num(info.get("dividendYield")),
         "beta": num(info.get("beta")),
@@ -128,6 +145,138 @@ def get_market_data(ticker: str) -> dict:
     return result
 
 
+def get_etf_info(ticker: str) -> dict:
+    """ETF / fund profile: AUM, expense ratio, yield, top holdings, sector mix.
+
+    For thematic investing the fund is often the natural instrument (NLR, URA,
+    NUKZ...), and stock-shaped tools error on funds (no market cap, no
+    margins). This returns the fund-shaped facts instead: assets under
+    management, expense ratio, distribution yield, category, top-10 holdings
+    with weights, sector weightings, and trailing performance. Holdings data
+    comes from the provider and may lag a few weeks. Fails soft on fields the
+    provider doesn't supply.
+    """
+    ticker = normalize_ticker(ticker)
+    if not ticker:
+        return {"error": "no ticker provided"}
+
+    info = get_info(ticker)
+    fast = get_fast_info(ticker)
+    price = (num(info.get("regularMarketPrice")) or num(info.get("navPrice"))
+             or num(fast.get("last_price")))
+    if price is None:
+        return missing_data_error(ticker, ["price"], partial={
+            "name": info.get("shortName") or info.get("longName")})
+
+    def produce_funds_data() -> dict:
+        holdings, sectors, overview, expense = [], {}, {}, None
+        try:
+            fd = yf.Ticker(ticker).funds_data
+            try:
+                th = fd.top_holdings
+                if th is not None and not th.empty:
+                    for sym, row in th.iterrows():
+                        w = num(row.get("Holding Percent"))
+                        holdings.append({
+                            "symbol": str(sym),
+                            "name": row.get("Name"),
+                            "weight_pct": round(w * 100, 2) if w is not None else None,
+                        })
+            except Exception:
+                pass
+            try:
+                sw = fd.sector_weightings
+                if isinstance(sw, dict):
+                    sectors = {k: round(float(v) * 100, 2)
+                               for k, v in sw.items() if num(v)}
+            except Exception:
+                pass
+            try:
+                ov = fd.fund_overview
+                if isinstance(ov, dict):
+                    overview = ov
+            except Exception:
+                pass
+            try:
+                ops = fd.fund_operations
+                if ops is not None and not ops.empty:
+                    er = ops.loc["Annual Report Expense Ratio"].iloc[0]
+                    expense = round(float(er) * 100, 2) if er == er else None
+            except Exception:
+                pass
+        except Exception:
+            pass  # funds_data unavailable — info-level fields still useful
+        return {"holdings": holdings, "sectors": sectors,
+                "overview": overview, "expense_ratio": expense}
+
+    from .common import TTL_HISTORY, cached
+    funds = cached(("funds_data", ticker), produce_funds_data,
+                   ttl=TTL_HISTORY, disk=True)
+    holdings, sectors, overview = funds["holdings"], funds["sectors"], funds["overview"]
+    expense_ratio = num(info.get("netExpenseRatio"))
+    if expense_ratio is None:
+        expense_ratio = funds["expense_ratio"]
+
+    # Trailing performance from price history (2y so the 1y point exists).
+    perf = {}
+    hist = get_history(ticker, period="2y")
+    if hist is not None and not hist.empty and "Close" in hist:
+        close = hist["Close"].dropna()
+        for label, days in (("1m", 21), ("3m", 63), ("6m", 126), ("1y", 252)):
+            if len(close) > days and close.iloc[-(days + 1)] > 0:
+                perf[label] = round(
+                    float(close.iloc[-1] / close.iloc[-(days + 1)] - 1) * 100, 2)
+
+    y = num(info.get("yield")) or num(info.get("dividendYield"))
+    return {
+        "ticker": ticker,
+        "name": info.get("longName") or info.get("shortName"),
+        "instrument_type": info.get("quoteType") or "ETF",
+        "category": info.get("category") or overview.get("categoryName"),
+        "fund_family": info.get("fundFamily") or overview.get("family"),
+        "price": price,
+        "aum": num(info.get("totalAssets")),
+        "expense_ratio_pct": expense_ratio,
+        "distribution_yield_pct": round(y * 100, 2) if (y is not None and y < 1) else y,
+        "beta_3y": num(info.get("beta3Year")),
+        "ytd_return_pct": (round(num(info.get("ytdReturn")) * 100, 2)
+                           if num(info.get("ytdReturn")) is not None else None),
+        "three_year_avg_return_pct": (round(num(info.get("threeYearAverageReturn")) * 100, 2)
+                                      if num(info.get("threeYearAverageReturn")) is not None else None),
+        "performance_pct": perf,
+        "top_holdings": holdings,
+        "sector_weights_pct": sectors,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "note": "holdings/sector data is provider-supplied and may lag; for "
+                "single-stock analysis of a holding, use the stock tools",
+    }
+
+
+# Titles that are listicle/clickbait churn rather than company news. These
+# dominated dogfooding output ("5 stocks winning the AI race" echoed across
+# every ticker) and drowned the real catalysts.
+_GENERIC_TITLE_RE = re.compile(
+    r"(^\d+\s|\b\d+\s+(best|top|magnificent|cheap|great|hot|super)?\s*"
+    r"(stocks?|etfs?|picks|reasons|things|ways|moves|buys)\b"
+    r"|\bbetter buy\b|^prediction[:\s]|^should you buy\b|^is it too late\b"
+    r"|\bmillionaire\b|\bbuy the dip\b|^if you.?d invested\b)",
+    re.IGNORECASE,
+)
+
+
+def _company_tokens(ticker: str, info: dict) -> list[str]:
+    """Tokens that mark a headline as company-specific: the ticker plus the
+    distinctive first word(s) of the company name."""
+    tokens = [ticker.lower()]
+    name = (info.get("shortName") or info.get("longName") or "")
+    for word in re.split(r"[\s,.]+", name)[:2]:
+        w = word.lower().strip("&()")
+        if len(w) >= 4 and w not in ("corp", "inc", "company", "holdings",
+                                     "group", "energy", "the"):
+            tokens.append(w)
+    return tokens
+
+
 def _news_timestamp(item: dict) -> str | None:
     """Defensively extract an ISO timestamp across yfinance schema variants."""
     content = item.get("content") if isinstance(item.get("content"), dict) else None
@@ -147,8 +296,15 @@ def _news_timestamp(item: dict) -> str | None:
     return None
 
 
-def get_recent_news(ticker: str, limit: int = 5) -> dict:
-    """Recent news headlines for a ticker: title, publisher, timestamp, link.
+def get_recent_news(ticker: str, limit: int = 5,
+                    include_generic: bool = False) -> dict:
+    """Recent news headlines for a ticker, filtered for signal.
+
+    Deduplicates repeated stories and tags each headline as company-specific
+    or generic. Listicle/clickbait churn ("5 stocks winning the AI race") is
+    filtered out by default — pass include_generic=True to see everything.
+    Returns title, publisher, timestamp, link per item, plus how many items
+    were filtered.
 
     News is the least critical input and its provider schema is unstable, so
     this fails soft: if the feed is unavailable or unparseable it returns
@@ -163,8 +319,9 @@ def get_recent_news(ticker: str, limit: int = 5) -> dict:
     if not raw:
         return {"error": "news unavailable", "ticker": ticker, "items": []}
 
-    items = []
-    for item in raw[: max(0, int(limit))]:
+    tokens = _company_tokens(ticker, get_info(ticker))
+    parsed, seen_titles = [], set()
+    for item in raw:
         if not isinstance(item, dict):
             continue
         content = item.get("content") if isinstance(item.get("content"), dict) else None
@@ -188,17 +345,34 @@ def get_recent_news(ticker: str, limit: int = 5) -> dict:
 
         if not title:
             continue
-        items.append({
+        # Dedup: the same wire story echoes across tickers/publishers.
+        key = re.sub(r"[^a-z0-9]+", "", title.lower())
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+
+        title_l = title.lower()
+        parsed.append({
             "title": title,
             "publisher": publisher,
             "published": _news_timestamp(item),
             "link": link,
+            "company_specific": any(t in title_l for t in tokens),
+            "generic": bool(_GENERIC_TITLE_RE.search(title)),
         })
 
-    if not items:
+    if not parsed:
         return {"error": "news unavailable (unrecognized feed schema)",
                 "ticker": ticker, "items": []}
-    return {"ticker": ticker, "items": items}
+
+    # Company-specific, non-listicle headlines first.
+    parsed.sort(key=lambda i: (not i["company_specific"], i["generic"]))
+    kept = parsed if include_generic else [i for i in parsed if not i["generic"]]
+    if not kept:  # everything was listicle churn — better to show it than nothing
+        kept = parsed
+    n = max(0, int(limit))
+    return {"ticker": ticker, "items": kept[:n],
+            "filtered_out": len(parsed) - min(len(kept), n)}
 
 
 def get_earnings_calendar(ticker: str) -> dict:
@@ -212,11 +386,8 @@ def get_earnings_calendar(ticker: str) -> dict:
     ticker = normalize_ticker(ticker)
     if not ticker:
         return {"error": "no ticker provided"}
-    try:
-        tk = yf.Ticker(ticker)
-        edf = tk.earnings_dates
-    except Exception:
-        edf = None
+    tk = yf.Ticker(ticker)
+    edf = get_earnings_dates_raw(ticker)
 
     next_date, days_until, surprises = None, None, []
     today = date.today()
@@ -252,6 +423,15 @@ def get_earnings_calendar(ticker: str) -> dict:
         except Exception:
             pass
 
+    # A stale schedule can leave only past dates — a date in the past is not a
+    # "next" earnings date (dogfooding: RGTI returned days_until=-29).
+    stale_note = None
+    if next_date is not None and next_date < today:
+        stale_note = (f"provider schedule is stale (last known date "
+                      f"{next_date.isoformat()} already passed); next date not "
+                      f"yet published")
+        next_date = None
+
     if next_date:
         days_until = (next_date - today).days
 
@@ -264,6 +444,8 @@ def get_earnings_calendar(ticker: str) -> dict:
         "days_until": days_until,
         "recent_surprises": surprises,
     }
+    if stale_note:
+        result["note"] = stale_note
     if days_until is not None and 0 <= days_until <= 14:
         result["flag"] = (f"earnings in {days_until} days — material event risk; "
                           f"a view formed now could be invalidated on the report")
@@ -303,7 +485,7 @@ def get_dividend_info(ticker: str) -> dict:
     # Cut scan: build annual dividend totals from the payment history.
     cuts, years_paid = [], None
     try:
-        divs = yf.Ticker(ticker).dividends
+        divs = get_dividends_raw(ticker)
         if divs is not None and not divs.empty:
             payments = [(ts, float(amt)) for ts, amt in divs.items() if float(amt) > 0]
             if payments:

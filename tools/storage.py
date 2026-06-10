@@ -97,7 +97,10 @@ def save_decision(ticker: str, decision: str, rationale: str) -> dict:
 
     `decision` must be one of: buy, sell, hold, pass, wait. Records a UTC
     timestamp, the ticker, the decision, the rationale, and a review_after date
-    (six months out) for revisiting the call. Returns the stored entry.
+    (six months out) for revisiting the call. If an analyze_stocks scorecard
+    exists for the ticker, its snapshot date is attached (snapshot_as_of) so
+    the review can pull exactly what was known at decision time via
+    read_snapshot. Returns the stored entry.
     """
     ticker = normalize_ticker(ticker)
     if not ticker:
@@ -117,6 +120,17 @@ def save_decision(ticker: str, decision: str, rationale: str) -> dict:
         "rationale": rationale.strip(),
         "review_after": _plus_six_months(now.date()).isoformat(),
     }
+    # Join the decision to the point-in-time evidence: the latest archived
+    # battery scorecard, if one exists.
+    snap = data_dir() / "snapshots" / f"{ticker}.jsonl"
+    if snap.exists():
+        try:
+            last = snap.read_text(encoding="utf-8").rstrip().rsplit("\n", 1)[-1]
+            as_of = json.loads(last).get("as_of")
+            if as_of:
+                entry["snapshot_as_of"] = as_of
+        except (OSError, ValueError):
+            pass
     try:
         with _decisions_path().open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")

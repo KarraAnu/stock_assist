@@ -14,8 +14,9 @@ from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
+from tools.battery import analyze_stocks, read_snapshot
 from tools.common import clear_cache, data_dir
-from tools.filings import get_sec_filings
+from tools.filings import get_rpo, get_sec_filings
 from tools.fmp import have_key
 from tools.fundamentals import (
     get_financials,
@@ -24,13 +25,15 @@ from tools.fundamentals import (
     get_quality_scores,
     reverse_dcf,
 )
-from tools.indicators import get_indicators, get_valuation_context
+from tools.indicators import get_indicators
 from tools.market import (
     get_dividend_info,
     get_earnings_calendar,
+    get_etf_info,
     get_market_data,
     get_recent_news,
 )
+from tools.ownership import get_ownership
 from tools.alpaca import (
     paper_account,
     paper_orders,
@@ -52,11 +55,18 @@ mcp = FastMCP("stock-eval")
 
 # Register tools. Docstrings on each function are the tool contract the model
 # reads to decide when to call them — keep them accurate.
+# v4: the batch deep battery — the primary tool for multi-name evaluation.
+mcp.tool()(analyze_stocks)
+mcp.tool()(read_snapshot)  # point-in-time recall of archived scorecards
 mcp.tool()(get_market_data)
+mcp.tool()(get_etf_info)
+mcp.tool()(get_ownership)
 mcp.tool()(get_recent_news)
 mcp.tool()(get_indicators)
-mcp.tool()(get_valuation_context)
+# get_valuation_context was retired in v4: it reported a third, unlabeled P/E
+# basis that contradicted the canonical bases (see tools/core.py).
 mcp.tool()(get_sec_filings)
+mcp.tool()(get_rpo)  # contracted backlog from SEC XBRL — FMP can't supply it
 # v2: fundamentals / quality / valuation / peers / reverse-DCF (FMP-backed)
 mcp.tool()(get_financials)
 mcp.tool()(get_quality_scores)
@@ -94,7 +104,7 @@ def healthcheck() -> dict:
     after setup, and this tells you in one call whether the data sources are
     reachable rather than leaving you guessing.
     """
-    clear_cache()  # exercise live fetches, not stale cache
+    clear_cache(include_disk=True)  # exercise live fetches, not stale cache
     report: dict = {"checked_at": datetime.now(timezone.utc).isoformat(),
                     "data_dir": str(data_dir()), "checks": {}}
 

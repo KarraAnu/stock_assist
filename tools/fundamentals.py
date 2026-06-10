@@ -8,6 +8,7 @@ All default to a 3-year window. Every tool fails loudly if FMP is unavailable.
 from __future__ import annotations
 
 from .common import get_info, normalize_ticker, num
+from .core import fcf_bases, live_market_cap, pe_bases
 from .fmp import FMPError, fmp_get, have_key
 
 
@@ -121,20 +122,78 @@ def get_financials(ticker: str, years: int = 3) -> dict:
     trends = _financial_trends(rows)
     normalized = _normalized(rows)
     bal = balance[0] if balance else {}
-    cash_eq = num(bal.get("cashAndShortTermInvestments")) or num(bal.get("cashAndCashEquivalents"))
-    stage = _company_stage(rows, cash_eq)
-    return {"ticker": ticker, "years": len(rows), "annual": rows,
-            "trends": trends, "normalized": normalized,
-            "company_stage": stage,
-            "source": "Financial Modeling Prep"}
+    fy_cash = num(bal.get("cashAndShortTermInvestments")) or num(bal.get("cashAndCashEquivalents"))
+    # Most-recent-quarter cash from yfinance: FY-end cash misses mid-year
+    # raises in exactly the cash-burning names where runway matters (RGTI's
+    # $350M ATM made the FY-based runway read 0.6yr against ~$600M actual).
+    mrq_cash = num(get_info(ticker).get("totalCash"))
+    stage = _company_stage(rows, fy_cash, mrq_cash)
+
+    result = {"ticker": ticker, "years": len(rows), "annual": rows,
+              "trends": trends, "normalized": normalized,
+              "company_stage": stage,
+              "source": "Financial Modeling Prep"}
+
+    # Billed-backlog proxy. The full contracted backlog (RPO) is a footnote
+    # disclosure FMP can't supply — see get_rpo (SEC XBRL).
+    d_cur = num(bal.get("deferredRevenue"))
+    d_non = num(bal.get("deferredRevenueNonCurrent"))
+    if d_cur or d_non:
+        result["deferred_revenue"] = {
+            "current": d_cur, "non_current": d_non,
+            "note": "FY-end billed-backlog proxy; full contracted backlog is "
+                    "RPO — see get_rpo",
+        }
+
+    quarterly = _quarterly_revenue(ticker, rows)
+    if quarterly:
+        result["quarterly"] = quarterly
+    return result
 
 
-def _company_stage(rows: list[dict], cash: float | None) -> dict:
+def _quarterly_revenue(ticker: str, rows: list[dict]) -> dict | None:
+    """Last 8 quarters of revenue for sub-scale names (revenue < $500M).
+
+    Annual data hides the lumpiness of system-sale businesses: QBTS showed
+    "revenue grew every year" (fiscal years) AND "-81% growth" (TTM) at the
+    same time — both true, because one quarter carried a one-time system sale.
+    The quarterly series makes that visible deterministically.
+    """
+    latest_rev = rows[0].get("revenue") if rows else None
+    if latest_rev is not None and latest_rev >= 500_000_000:
+        return None
+    try:
+        qinc = fmp_get("income-statement", symbol=ticker, period="quarter", limit=8)
+    except FMPError:
+        return None
+    if not qinc:
+        return None
+    import statistics
+    by_q, vals = {}, []
+    for q in qinc:
+        label = f"{q.get('fiscalYear')}-{q.get('period')}"
+        rv = num(q.get("revenue"))
+        by_q[label] = round(rv / 1e6, 2) if rv is not None else None
+        if rv is not None:
+            vals.append(rv)
+    out = {"revenue_by_quarter_usd_m": by_q}
+    if len(vals) >= 4:
+        med = statistics.median(vals)
+        if med > 0 and max(vals) > 2.5 * med:
+            out["flag"] = ("revenue is LUMPY — one quarter is >2.5x the median "
+                           "(likely one-time system sales); single-period YoY "
+                           "comps mislead in both directions")
+    return out
+
+
+def _company_stage(rows: list[dict], fy_cash: float | None,
+                   mrq_cash: float | None = None) -> dict:
     """Classify lifecycle stage and (for cash-burners) the cash runway.
 
     Pre-revenue/early-stage names can't be judged on P/E or margins — the
-    decisive question is how long the cash lasts. This returns the stage plus,
-    when free cash flow is negative, runway = cash / annual burn (in years).
+    decisive question is how long the cash lasts. Runway prefers the
+    most-recent-quarter cash figure over fiscal-year-end (which goes stale the
+    moment a company raises), and labels which one it used.
     """
     latest = rows[0] if rows else {}
     rev = latest.get("revenue")
@@ -151,14 +210,25 @@ def _company_stage(rows: list[dict], cash: float | None) -> dict:
     else:
         stage = "transitional / inconsistent profitability"
 
+    cash = mrq_cash if mrq_cash is not None else fy_cash
+    cash_as_of = "most recent quarter (yfinance)" if mrq_cash is not None \
+        else "fiscal-year-end (FMP)"
+
     runway = None
     if fcf is not None and fcf < 0 and cash is not None and cash > 0:
         yrs = round(cash / abs(fcf), 1)
         runway = {
-            "cash": cash, "annual_burn": abs(fcf), "runway_years": yrs,
+            "cash": cash, "cash_as_of": cash_as_of, "annual_burn": abs(fcf),
+            "runway_years": yrs,
             "flag": (f"only {yrs}yr of cash at current burn — expect dilution or "
                      f"a raise soon" if yrs < 2 else f"{yrs}yr of cash at current burn"),
         }
+        if (mrq_cash is not None and fy_cash is not None and fy_cash > 0
+                and abs(mrq_cash - fy_cash) / fy_cash > 0.4):
+            chg = (mrq_cash / fy_cash - 1) * 100
+            runway["note"] = (f"cash moved {chg:+.0f}% since fiscal-year-end "
+                              f"(likely a raise or heavy spend) — runway uses "
+                              f"the fresher quarter-end figure")
     elif fcf is not None and fcf >= 0:
         runway = {"note": "free-cash-flow positive — runway not a concern"}
 
@@ -281,27 +351,54 @@ def get_quality_scores(ticker: str) -> dict:
     current_ratio = num(r.get("currentRatio"))
 
     flags = []
+    # Ratio-on-a-negative-denominator artifact: with negative EBITDA the
+    # leverage ratio is meaningless garbage (QUBT printed 53.9x). Same limit=5
+    # call the distress composite makes, so it's served from cache.
+    try:
+        income = fmp_get("income-statement", symbol=ticker, period="annual", limit=5)
+    except FMPError:
+        income = []
+    ebitda = num(income[0].get("ebitda")) if income else None
+    if net_debt_ebitda is not None and ebitda is not None and ebitda <= 0:
+        flags.append("net debt/EBITDA not meaningful — EBITDA is negative; "
+                     "judge leverage on cash runway and interest coverage instead")
+        net_debt_ebitda = None
     if piotroski is not None:
         if piotroski >= 8:
             flags.append(f"Piotroski {piotroski:.0f}/9 — financially strong")
         elif piotroski <= 3:
             flags.append(f"Piotroski {piotroski:.0f}/9 — weak financials")
-    # Sector-aware Altman handling: the classic Z-score is calibrated for
-    # manufacturers and OVER-scores asset-light/lease-heavy retailers and
-    # financials (it rated Bed Bath & Beyond "safe" months before bankruptcy).
-    # Always pair it with the model-independent distress composite below.
+    # Distress handling: the sector-aware composite LEADS, Altman Z follows
+    # with caveats. The classic Z-score is calibrated for manufacturers — it
+    # rated Bed Bath & Beyond "safe" months before bankruptcy, and falsely
+    # cried "bankruptcy risk" on merchant-power utilities (CEG/VST at Z~1.5)
+    # whose balance sheets the composite read as fine. The scary headline must
+    # never outrun the better signal.
     distress = _distress_composite(ticker)
     sector = distress.get("sector")
     z_reliable = sector not in {"Consumer Cyclical", "Consumer Defensive",
-                                "Financial Services", "Real Estate"}
-    if altman is not None:
-        zone = ("distress zone (elevated bankruptcy risk)" if altman < 1.81
-                else "grey zone" if altman < 2.99 else "safe zone")
-        caveat = "" if z_reliable else (
-            f" — but Altman Z is unreliable for {sector}; "
-            f"defer to the distress_composite")
-        flags.append(f"Altman Z {altman:.1f} — {zone}{caveat}")
+                                "Financial Services", "Real Estate",
+                                "Utilities", "Energy"}
+    if distress.get("available"):
+        flags.append(f"distress composite (sector-aware, the primary solvency "
+                     f"signal): {distress.get('severity')} "
+                     f"({distress.get('red_flag_count')} red flag(s))")
     flags.extend(distress.get("flags", []))
+    if altman is not None:
+        zone = ("distress zone" if altman < 1.81
+                else "grey zone" if altman < 2.99 else "safe zone")
+        composite_benign = (distress.get("available")
+                            and distress.get("severity") in ("none", "watch"))
+        if altman < 1.81 and composite_benign:
+            flags.append(f"Altman Z {altman:.1f} reads 'distress' but is NOT "
+                         f"corroborated by the distress composite — for "
+                         f"{sector or 'this sector'} the Z-score is a known "
+                         f"false alarm; defer to the composite")
+        elif not z_reliable:
+            flags.append(f"Altman Z {altman:.1f} — {zone}; unreliable for "
+                         f"{sector}, defer to the distress_composite")
+        else:
+            flags.append(f"Altman Z {altman:.1f} — {zone}")
     if roic is not None and roic >= 15:
         flags.append(f"ROIC {roic:.0f}% — high returns on capital (strong moat signal)")
     if net_debt_ebitda is not None and net_debt_ebitda > 3:
@@ -433,18 +530,18 @@ def _loss_type(income: list[dict], sector: str | None, op0) -> str | None:
     return "uncertain — mixed signals; inspect the cause of the loss directly"
 
 
-def get_historical_valuation(ticker: str, years: int = 3) -> dict:
-    """Is the stock's current valuation high or low *for itself*? (default 3 yrs)
+def get_historical_valuation(ticker: str, years: int = 5) -> dict:
+    """Is the stock's valuation high or low *for itself*? (default 5 yrs)
 
-    Fills the gap the basic get_valuation_context could not: it pulls the
-    annual P/E, P/S, and P/B for the past `years` and reports each multiple's
-    range (min/avg/max) plus the most recent value's position within that range,
-    with a plain-language verdict (e.g. "P/E near the top of its 3-year range").
+    The RANGE comes from annual fiscal-year-end multiples (the only history
+    available); the CURRENT point is computed from the LIVE price, so the
+    position-in-range never lags an intraday move. (Dogfooding bug: the old
+    FY-end "current" still said "richly valued" after a crash.) Every P/E is
+    labeled with its EPS basis — ttm (one-times included) vs normalized
+    (median FY EPS) — and matches get_market_data / analyze_stocks exactly.
 
-    Note: based on annual fiscal-year-end multiples (a handful of points), so
-    treat it as directional context, not a precise percentile.
-
-    Sourced from Financial Modeling Prep. Returns {"error": ...} if unavailable.
+    Sourced from Financial Modeling Prep + live yfinance price.
+    Returns {"error": ...} if unavailable.
     """
     ticker = normalize_ticker(ticker)
     if not ticker:
@@ -456,11 +553,19 @@ def get_historical_valuation(ticker: str, years: int = 3) -> dict:
     try:
         ratios = fmp_get("ratios", symbol=ticker, period="annual", limit=n)
         income = fmp_get("income-statement", symbol=ticker, period="annual", limit=n)
-        profile = fmp_get("profile", symbol=ticker)
     except FMPError as exc:
         return _degraded(ticker, exc, "get_historical_valuation")
     if not ratios:
         return _degraded(ticker, "402", "get_historical_valuation")
+
+    # Canonical live bases — same numbers every other tool reports.
+    pe = pe_bases(ticker, n)
+    info = get_info(ticker)
+    live_current = {
+        "pe": pe["ttm"],
+        "ps": num(info.get("priceToSalesTrailing12Months")),
+        "pb": num(info.get("priceToBook")),
+    }
 
     field_map = {
         "pe": "priceToEarningsRatio",
@@ -475,11 +580,16 @@ def get_historical_valuation(ticker: str, years: int = 3) -> dict:
         if len(series) < 2:
             out[label] = None
             continue
-        current = series[0]  # newest first
+        current = live_current.get(label)
+        basis = "live price / TTM"
+        if current is None or current <= 0:
+            current = series[0]  # fall back to newest FY-end snapshot
+            basis = "FY-end snapshot (live unavailable)"
         lo, hi, avg = min(series), max(series), sum(series) / len(series)
         position = (current - lo) / (hi - lo) if hi > lo else None
         out[label] = {
             "current": round(current, 2),
+            "current_basis": basis,
             "min": round(lo, 2), "avg": round(avg, 2), "max": round(hi, 2),
             "position_in_range": round(position, 2) if position is not None else None,
             "years": len(series),
@@ -491,23 +601,17 @@ def get_historical_valuation(ticker: str, years: int = 3) -> dict:
             elif position <= 0.2:
                 flags.append(f"{name} near the bottom of its {len(series)}-yr range (cheap vs own history)")
 
-    # #7: normalized P/E — current price / median EPS over the window. Guards
+    # Normalized P/E — live price / median FY EPS (canonical basis). Guards
     # against the transitory-earnings trap (PFE looked cheap on COVID-windfall
-    # EPS, then fell 48%). If trailing P/E is far below normalized, the "cheap"
-    # is likely a peak-earnings illusion.
-    import statistics
+    # EPS, then fell 48%). If TTM P/E is far below normalized, the "cheap" is
+    # likely a peak-earnings illusion.
     eps_series = [num(s.get("epsDiluted")) for s in (income or [])]   # newest-first
     eps_series = [e for e in eps_series if e is not None]
     rev_series = [num(s.get("revenue")) for s in (income or [])]
     rev_series = [r for r in rev_series if r is not None]
-    price = num(profile[0].get("price")) if profile else None
+    norm_pe, ttm_pe = pe["normalized"], pe["ttm"]
     normalized = {}
-    if price and eps_series:
-        med_eps = statistics.median(eps_series)
-        trailing_eps = eps_series[0]
-        norm_pe = round(price / med_eps, 1) if med_eps > 0 else None
-        trailing_pe = round(price / trailing_eps, 1) if trailing_eps > 0 else None
-
+    if eps_series and (norm_pe or ttm_pe):
         # Is the earnings elevation growth-driven or a transitory peak? Use
         # revenue trend as the discriminator: steadily rising revenue backing a
         # rising-to-peak EPS = secular GROWTH (don't cry "unsustainable"); EPS
@@ -516,31 +620,35 @@ def get_historical_valuation(ticker: str, years: int = 3) -> dict:
         rev_up = (len(rev_chrono) >= 3
                   and sum(1 for a, b in zip(rev_chrono, rev_chrono[1:]) if b > a)
                   >= (len(rev_chrono) - 1) * 0.75)
-        eps_is_peak = trailing_eps >= max(eps_series)
+        latest_fy_eps = eps_series[0]
+        eps_is_peak = latest_fy_eps >= max(eps_series)
         secular_growth = rev_up and eps_is_peak
 
-        normalized = {"normalized_pe_on_median_eps": norm_pe,
-                      "trailing_pe": trailing_pe,
-                      "median_eps": round(med_eps, 2),
-                      "trailing_eps": round(trailing_eps, 2),
+        normalized = {"pe_normalized": norm_pe,
+                      "pe_ttm": ttm_pe,
+                      "eps_normalized_median": pe["eps"]["normalized_median"],
+                      "eps_ttm": pe["eps"]["ttm"],
+                      "basis": "live price; normalized = median FY diluted EPS "
+                               f"over {pe['eps']['window_years']} yrs, "
+                               "ttm = trailing-12mo reported (incl. one-times)",
                       "earnings_pattern": "secular-growth" if secular_growth
-                      else "elevated-vs-median" if (norm_pe and trailing_pe
-                                                    and norm_pe > trailing_pe * 1.5)
+                      else "elevated-vs-median" if (norm_pe and ttm_pe
+                                                    and norm_pe > ttm_pe * 1.5)
                       else "stable"}
-        if norm_pe and trailing_pe and norm_pe > trailing_pe * 1.5:
+        if norm_pe and ttm_pe and norm_pe > ttm_pe * 1.5:
             if secular_growth:
-                flags.append(f"normalized P/E ({norm_pe}) >> trailing ({trailing_pe}), "
+                flags.append(f"normalized P/E ({norm_pe}) >> ttm ({ttm_pe}), "
                              f"but EPS rose on a steady revenue uptrend — likely GROWTH, "
                              f"not a transitory peak; judge on forward P/E. (Caveat: a "
                              f"one-time DEMAND surge, e.g. COVID, can mimic this — verify "
                              f"the revenue growth is durable, not a single-event spike.)")
             else:
-                flags.append(f"transitory-earnings risk: trailing P/E {trailing_pe} "
+                flags.append(f"transitory-earnings risk: ttm P/E {ttm_pe} "
                              f"looks cheap but normalized P/E is {norm_pe}, and revenue "
                              f"is NOT in a steady uptrend — current earnings may be a "
                              f"peak that reverts (verify the cause)")
 
-    # #3: flag P/S when revenue is immaterial (P/S becomes meaningless).
+    # Flag P/S when revenue is immaterial (P/S becomes meaningless).
     ps_node = out.get("ps")
     if ps_node and ps_node.get("current", 0) > 50:
         flags.append("P/S is extreme (>50) — revenue is immaterial relative to "
@@ -548,10 +656,12 @@ def get_historical_valuation(ticker: str, years: int = 3) -> dict:
 
     return {"ticker": ticker, "multiples": out, "normalized": normalized,
             "flags": flags,
-            "method": "annual fiscal-year-end multiples; directional, not a precise percentile",
+            "method": "range from annual fiscal-year-end multiples (directional, "
+                      "not a precise percentile); CURRENT point from the live "
+                      "price so it reflects today's move",
             "peer_context": "for cross-sectional context (sector-relative, not just "
                             "vs own history), also call get_peers",
-            "source": "Financial Modeling Prep"}
+            "source": "Financial Modeling Prep + live yfinance price"}
 
 
 def get_peers(ticker: str, limit: int = 5) -> dict:
@@ -626,19 +736,24 @@ def reverse_dcf(ticker: str, discount_rate: float = 0.10,
     """What free-cash-flow growth rate is the current price already pricing in?
 
     Instead of guessing a fair value (a forward DCF launders your own growth
-    assumption into a number), this solves the inverse: given the current market
-    cap and latest free cash flow, what constant annual FCF growth over `years`
-    (default 10), plus a terminal growth of `terminal_growth` (default 2.5%) and
-    discount rate `discount_rate` (default 10%), is required to justify today's
-    price? The output is the *implied* growth rate — the human then judges
-    whether that growth is plausible.
+    assumption into a number), this solves the inverse: what constant annual
+    FCF growth over `years` (default 10), with terminal growth
+    `terminal_growth` (2.5%) and discount rate `discount_rate` (10%), justifies
+    today's market cap? The output is *implied* growth — the human judges
+    plausibility.
 
-    Simplifying assumptions (stated so the number isn't over-trusted): treats
-    free cash flow as cash to equity holders and market cap as the value to
-    match; ignores changing share count and net cash/debt nuances. Directional,
-    not a precise valuation. Fails if FCF is non-positive (model doesn't apply).
+    BASE-YEAR GUARD (dogfooding scar): a one-year FCF collapse/spike makes the
+    latest-FCF answer meaningless (a name once showed "priced for 50% growth"
+    purely because its base year cratered). So this anchors on the NORMALIZED
+    (median multi-year) FCF whenever the latest year deviates sharply from it,
+    and reports the implied growth on BOTH bases so the distortion is visible.
 
-    Sourced from Financial Modeling Prep. Returns {"error": ...} if unavailable.
+    Simplifying assumptions (stated so the number isn't over-trusted): FCF
+    treated as equity cash flow; market cap (live) as the value to match; share
+    count and net cash/debt changes ignored. Directional, not precise.
+
+    Sourced from Financial Modeling Prep + live market cap.
+    Returns {"error": ...} if unavailable.
     """
     ticker = normalize_ticker(ticker)
     if not ticker:
@@ -648,76 +763,120 @@ def reverse_dcf(ticker: str, discount_rate: float = 0.10,
     if discount_rate <= terminal_growth:
         return {"error": "discount_rate must exceed terminal_growth"}
 
-    try:
-        profile = fmp_get("profile", symbol=ticker)
-        cash = fmp_get("cash-flow-statement", symbol=ticker, period="annual", limit=1)
-    except FMPError as exc:
-        return _degraded(ticker, exc, "reverse_dcf")
+    fcf = fcf_bases(ticker, years=5)
+    market_cap = live_market_cap(ticker)
+    if market_cap is None:
+        try:
+            profile = fmp_get("profile", symbol=ticker)
+            market_cap = num(profile[0].get("marketCap")) if profile else None
+        except FMPError as exc:
+            return _degraded(ticker, exc, "reverse_dcf")
 
-    prof = profile[0] if profile else {}
-    market_cap = num(prof.get("marketCap"))
-    fcf = num(cash[0].get("freeCashFlow")) if cash else None
-
-    if market_cap is None or fcf is None:
+    latest = fcf["latest_fy"]
+    normalized = fcf["normalized_median"]
+    prior_med = fcf.get("prior_years_median")
+    if market_cap is None or latest is None:
         return {"error": f"missing market cap or FCF for {ticker}", "ticker": ticker,
-                "partial": {"market_cap": market_cap, "free_cash_flow": fcf}}
-    if fcf <= 0:
-        return {"error": f"{ticker} has non-positive free cash flow "
-                         f"({fcf:,.0f}) — reverse DCF does not apply",
-                "ticker": ticker, "free_cash_flow": fcf}
+                "partial": {"market_cap": market_cap, "free_cash_flow": latest}}
+
+    # Anchor base: when the latest year is distorted, prefer the prior-years
+    # median (the baseline the distortion was measured against), then the
+    # whole-series median; otherwise the latest year.
+    base_label, base_fcf = "latest_fy", latest
+    if fcf["distorted"]:
+        if prior_med and prior_med > 0:
+            base_label, base_fcf = "prior_years_median", prior_med
+        elif normalized and normalized > 0:
+            base_label, base_fcf = "normalized_median", normalized
+    if base_fcf is None or base_fcf <= 0:
+        return {"error": f"{ticker} has non-positive free cash flow on every "
+                         f"base (latest {latest:,.0f}) — reverse DCF does not apply",
+                "ticker": ticker, "fcf_bases": fcf}
 
     n = max(1, min(int(years), 30))
 
-    def pv_for_growth(g: float) -> float:
-        total = 0.0
-        cf = fcf
-        for t in range(1, n + 1):
-            cf = fcf * ((1 + g) ** t)
-            total += cf / ((1 + discount_rate) ** t)
-        terminal = cf * (1 + terminal_growth) / (discount_rate - terminal_growth)
-        total += terminal / ((1 + discount_rate) ** n)
-        return total
+    def implied_growth_for(fcf0: float) -> float | None:
+        """Bisect for the growth rate that makes PV(fcf0 growing) == market cap.
+        None means even >100%/yr can't justify the price."""
+        def pv(g: float) -> float:
+            total, cf = 0.0, fcf0
+            for t in range(1, n + 1):
+                cf = fcf0 * ((1 + g) ** t)
+                total += cf / ((1 + discount_rate) ** t)
+            terminal = cf * (1 + terminal_growth) / (discount_rate - terminal_growth)
+            return total + terminal / ((1 + discount_rate) ** n)
 
-    # Bisection for the growth rate that makes PV == market cap.
-    lo, hi = -0.50, 1.00
-    if pv_for_growth(hi) < market_cap:
-        return {"ticker": ticker,
-                "note": "even >100%/yr FCF growth can't justify the price under "
-                        "these assumptions — implied growth is extreme",
-                "implied_growth_pct": None, "market_cap": market_cap,
-                "latest_fcf": fcf, "assumptions": {
-                    "discount_rate_pct": discount_rate * 100,
-                    "terminal_growth_pct": terminal_growth * 100, "years": n}}
-    implied = None
-    for _ in range(100):
-        mid = (lo + hi) / 2
-        if pv_for_growth(mid) > market_cap:
-            hi = mid
+        lo, hi = -0.50, 1.00
+        if pv(hi) < market_cap:
+            return None
+        implied = None
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            if pv(mid) > market_cap:
+                hi = mid
+            else:
+                lo = mid
+            implied = mid
+            if hi - lo < 1e-6:
+                break
+        return implied
+
+    results = {}
+    for label, f in (("latest_fy", latest), ("prior_years_median", prior_med),
+                     ("normalized_median", normalized)):
+        if f is not None and f > 0:
+            g = implied_growth_for(f)
+            results[label] = round(g * 100, 1) if g is not None else None
         else:
-            lo = mid
-        implied = mid
-        if hi - lo < 1e-6:
-            break
+            results[label] = "n/a (non-positive FCF on this base)"
 
-    implied_pct = round(implied * 100, 1)
-    verdict = ("modest — easily achievable for a healthy company" if implied_pct < 5
-               else "moderate — plausible for a solid grower" if implied_pct < 12
-               else "high — requires sustained strong execution" if implied_pct < 20
-               else "very high — priced for exceptional, prolonged growth")
+    implied_pct = results.get(base_label)
+    flags = []
+    if fcf.get("distorted"):
+        flags.append(fcf.get("note", "latest-FY FCF base is distorted"))
+        if base_label != "latest_fy":
+            flags.append(f"anchoring on {base_label} FCF; the latest-FCF implied "
+                         f"growth ({results.get('latest_fy')}%) is shown for "
+                         f"transparency but should not drive the judgment")
+        else:
+            flags.append("no positive normalized base exists (prior-year FCF "
+                         "negative), so the latest year is the only usable base "
+                         "— treat the implied growth as unreliable and judge on "
+                         "the FCF trajectory instead")
+    if fcf.get("volatile_series"):
+        flags.append(fcf.get("volatility_note", "FCF series is volatile"))
+
+    if implied_pct is None:
+        interpretation = ("even >100%/yr FCF growth can't justify the price "
+                          "under these assumptions — implied growth is extreme")
+        verdict = None
+    else:
+        verdict = ("modest — easily achievable for a healthy company" if implied_pct < 5
+                   else "moderate — plausible for a solid grower" if implied_pct < 12
+                   else "high — requires sustained strong execution" if implied_pct < 20
+                   else "very high — priced for exceptional, prolonged growth")
+        interpretation = (f"The market is pricing in ~{implied_pct}% annual FCF "
+                          f"growth for {n} years (on the {base_label} base). "
+                          f"That is {verdict}.")
 
     return {
         "ticker": ticker,
         "implied_fcf_growth_pct": implied_pct,
-        "interpretation": f"The market is pricing in ~{implied_pct}% annual FCF "
-                          f"growth for {n} years. That is {verdict}.",
+        "fcf_base_used": base_label,
+        "implied_growth_by_base_pct": results,
+        "interpretation": interpretation,
         "market_cap": market_cap,
-        "latest_fcf": fcf,
+        "fcf_bases": {"latest_fy": latest, "prior_years_median": prior_med,
+                      "normalized_median": normalized,
+                      "deviation_pct": fcf.get("deviation_pct"),
+                      "by_year": fcf.get("by_year")},
+        "flags": flags,
         "assumptions": {
             "discount_rate_pct": discount_rate * 100,
             "terminal_growth_pct": terminal_growth * 100,
             "explicit_years": n,
             "simplification": "FCF treated as equity cash flow; share count and "
-                              "net debt changes ignored",
+                              "net debt changes ignored; market cap is live",
         },
-        "source": "Financial Modeling Prep",
+        "source": "Financial Modeling Prep + live yfinance market cap",
     }

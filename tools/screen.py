@@ -9,7 +9,7 @@ lookups.
 
 from __future__ import annotations
 
-from .common import normalize_ticker, num
+from .common import normalize_ticker, num, parallel_map
 from .market import get_market_data
 from .universe import get_universe
 
@@ -165,8 +165,10 @@ def screen_stocks(tickers, rank_by: str = "value") -> dict:
     rank_by = rank_by if rank_by in {"value", "quality", "income", "growth"} else "value"
 
     rows, skipped = [], []
-    for t in seen:
-        md = get_market_data(t)
+    for t, md in zip(seen, parallel_map(get_market_data, seen, workers=8)):
+        if md.get("instrument_type") in ("ETF", "MUTUALFUND"):
+            skipped.append(f"{t} (fund — use get_etf_info or analyze_stocks)")
+            continue
         if "error" in md or md.get("price") is None:
             skipped.append(t)
             continue
@@ -181,8 +183,8 @@ def screen_stocks(tickers, rank_by: str = "value") -> dict:
         "count": len(rows),
         "results": rows,
         "skipped": skipped,
-        "note": "screen narrows the field; confirm survivors with get_financials "
-                "(normalized), get_quality_scores (distress), and reverse_dcf.",
+        "note": "screen narrows the field; deep-dive the survivors in one call "
+                "with analyze_stocks.",
     }
 
 
@@ -230,16 +232,17 @@ def scan_universe(sleeve: str = "value", top_n: int = 100,
 
     Takes the top `top_n`, assigns each a confidence weight (score**power,
     capped at `max_weight`). Returns each pick with metrics, score, verdict, and
-    target weight. NOTE: the value scan (~500 names) takes a few minutes; growth
-    and IPO are faster. Names that fail to fetch are counted under "skipped".
+    target weight. Fetches run in parallel — the full S&P scan takes about a
+    minute on a cold cache, much less when cached. Names that fail to fetch are
+    counted under "skipped".
     """
     universe, rank_by, exclude = _SLEEVES.get(sleeve, _SLEEVES["value"])
     tickers = get_universe(universe)
 
     rows, skipped = [], 0
-    for t in tickers:
-        md = get_market_data(t)
-        if "error" in md or md.get("price") is None:
+    for t, md in zip(tickers, parallel_map(get_market_data, tickers, workers=8)):
+        if ("error" in md or md.get("price") is None
+                or md.get("instrument_type") in ("ETF", "MUTUALFUND")):
             skipped += 1
             continue
         r = _row(md)
