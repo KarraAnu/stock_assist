@@ -16,6 +16,7 @@ import json
 from datetime import date, datetime, timezone
 
 from .common import data_dir, normalize_ticker, num, parallel_map
+from .estimates import get_estimates
 from .filings import get_rpo
 from .fmp import FMPError, fmp_get
 from .fundamentals import (
@@ -273,6 +274,28 @@ def _analyze_one(ticker: str) -> dict:
         row["rpo"] = {"available": False,
                       "note": "total RPO not XBRL-tagged — absence does not "
                               "mean no backlog; check filings/IR"}
+
+    # Forward consensus + revision momentum — what the Street expects and
+    # which way expectations are moving. Sparse coverage is normal.
+    try:
+        est = get_estimates(ticker)
+    except Exception:  # noqa: BLE001
+        est = {}
+    est_block = {k: est[k] for k in ("fwd_revenue_growth_pct",
+                                     "fwd_eps_growth_pct", "fwd_peg")
+                 if est.get(k) is not None}
+    revs = est.get("eps_revisions") or {}
+    nfy = revs.get("next_fy") or revs.get("current_fy") or {}
+    if nfy.get("revision_90d_pct") is not None:
+        est_block["eps_revision_90d_pct"] = nfy["revision_90d_pct"]
+    pt = est.get("price_target") or {}
+    if pt.get("momentum_pct") is not None:
+        est_block["target_momentum_pct"] = pt["momentum_pct"]
+    if est_block:
+        row["estimates"] = est_block
+        for f in est.get("flags") or []:
+            if f not in row["flags"]:
+                row["flags"].append(f)
 
     spec = _speculative_scorecard(ticker, md, fin, rpo, own, row)
     if spec:
