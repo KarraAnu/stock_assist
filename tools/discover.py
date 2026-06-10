@@ -109,7 +109,7 @@ def discover_stocks(signal: str = "fallen_growth", limit: int = 25) -> dict:
         while the price derated. Scans the full US market (>$300M cap).
       - "quiet_compounders": FCF yield >= 5%, revenue growth >= 5%, profitable,
         with thin analyst coverage (<= 8) — quality nobody is watching.
-        Scans S&P 500 + the growth universe.
+        Scans the full US market (>$300M cap).
       - "backlog_inflection": contracted backlog (RPO, SEC XBRL) growing 50%+
         YoY and material vs market cap — the IonQ pattern, visible quarters
         before the income statement moves. Scans the growth universe.
@@ -132,8 +132,23 @@ def discover_stocks(signal: str = "fallen_growth", limit: int = 25) -> dict:
             if off is None or g is None:
                 continue
             if off <= -40 and g >= 20:
+                # Materiality gate: growth off a sub-$50M base is noise
+                # (biotech milestone payments, near-zero denominators).
+                ps = num(md.get("valuation", {}).get("price_to_sales_ttm"))
+                mcap = md.get("market_cap")
+                est_rev = (mcap / ps) if (ps and ps > 0 and mcap) else None
+                if est_rev is not None and est_rev < 50e6:
+                    continue
                 row["reason"] = (f"{abs(off):.0f}% off its high with revenue "
                                  f"still growing {g:.0f}%")
+                if est_rev is None:
+                    row["caution"] = ("revenue scale unverifiable from "
+                                      "snapshot — confirm the base is real")
+                if row.get("industry") == "Capital Markets":
+                    row["caution"] = ("Capital Markets 'revenue' is often "
+                                      "mark-to-market/trading gains "
+                                      "(crypto-treasury pattern) — verify "
+                                      "it's operating revenue")
                 results.append(row)
         results.sort(key=lambda r: (r["revenue_growth_pct"] or 0), reverse=True)
         return {"signal": signal, "scanned": len(pool),
@@ -143,7 +158,9 @@ def discover_stocks(signal: str = "fallen_growth", limit: int = 25) -> dict:
                         "of these fell for good reasons"}
 
     if signal == "quiet_compounders":
-        pool = list(dict.fromkeys(get_universe("sp500") + get_universe("growth")))
+        # Full-market pool: "under-followed" and "S&P 500" are nearly
+        # disjoint sets — the premise needs the broad universe.
+        pool = _market_pool()
         results = []
         for md in _md_rows(pool):
             row = _brief(md, "")

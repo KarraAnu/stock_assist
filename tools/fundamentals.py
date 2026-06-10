@@ -601,6 +601,12 @@ def get_historical_valuation(ticker: str, years: int = 5) -> dict:
             elif position <= 0.2:
                 flags.append(f"{name} near the bottom of its {len(series)}-yr range (cheap vs own history)")
 
+    max_years = max((node["years"] for node in out.values() if node), default=0)
+    if 0 < max_years < 3:
+        flags.append(f"only {max_years} fiscal year(s) of multiple history — "
+                     f"vs-own-history positions are weak context (recent "
+                     f"listing); lean on peer/basket comparison instead")
+
     # Normalized P/E — live price / median FY EPS (canonical basis). Guards
     # against the transitory-earnings trap (PFE looked cheap on COVID-windfall
     # EPS, then fell 48%). If TTM P/E is far below normalized, the "cheap" is
@@ -680,14 +686,55 @@ def get_peers(ticker: str, limit: int = 5) -> dict:
     if not have_key():
         return _degraded(ticker, "no_key", "get_peers")
 
+    # Peers = same industry, nearest market cap, via the screener. FMP's
+    # stock-peers endpoint returned Bilibili and Duolingo as quantum-hardware
+    # peers and MicroStrategy as a design-software peer — classification
+    # nonsense. The screener route is deterministic; stock-peers remains the
+    # fallback when industry/mcap are missing.
     try:
-        peers = fmp_get("stock-peers", symbol=ticker)
+        profile = fmp_get("profile", symbol=ticker)
     except FMPError as exc:
         return _degraded(ticker, exc, "get_peers")
-    if not peers:
-        return _degraded(ticker, "402", "get_peers")
+    prof = profile[0] if profile else {}
+    industry = prof.get("industry")
+    mcap = num(prof.get("marketCap"))
 
-    peer_symbols = [p.get("symbol") for p in peers if p.get("symbol")][: max(1, int(limit))]
+    peer_rows: list[tuple] = []
+    if industry and mcap and mcap > 0:
+        try:
+            rows = fmp_get("company-screener", industry=industry,
+                           marketCapMoreThan=int(mcap * 0.05),
+                           marketCapLowerThan=int(mcap * 20),
+                           isEtf="false", isActivelyTrading="true", limit=100)
+        except FMPError:
+            rows = []
+        import math
+        cands = []
+        for r in rows if isinstance(rows, list) else []:
+            sym = str(r.get("symbol") or "").upper()
+            pcap = num(r.get("marketCap"))
+            exch = str(r.get("exchange") or "").upper()
+            if (sym and sym != ticker and pcap and pcap > 0
+                    and sym.isalpha() and len(sym) <= 5
+                    and any(x in exch for x in ("NASDAQ", "NYSE", "NEW YORK",
+                                                "AMEX", "AMERICAN"))):
+                cands.append((abs(math.log(pcap / mcap)), sym, pcap,
+                              r.get("companyName")))
+        cands.sort()
+        peer_rows = [(sym, pcap, name)
+                     for _, sym, pcap, name in cands[: max(1, int(limit))]]
+
+    if not peer_rows:
+        try:
+            peers = fmp_get("stock-peers", symbol=ticker)
+        except FMPError as exc:
+            return _degraded(ticker, exc, "get_peers")
+        peer_rows = [(p.get("symbol"),
+                      num(p.get("mktCap") or p.get("marketCap")),
+                      p.get("companyName"))
+                     for p in (peers or []) if p.get("symbol")][: max(1, int(limit))]
+    if not peer_rows:
+        return _degraded(ticker, "402", "get_peers")
 
     def multiples_for(sym: str) -> dict:
         try:
@@ -700,15 +747,12 @@ def get_peers(ticker: str, limit: int = 5) -> dict:
 
     target = multiples_for(ticker)
     table = []
-    for p in peers:
-        sym = p.get("symbol")
-        if sym not in peer_symbols:
-            continue
+    for sym, pcap, name in peer_rows:
         mult = multiples_for(sym)
         table.append({
             "symbol": sym,
-            "name": p.get("companyName"),
-            "market_cap": num(p.get("mktCap") or p.get("marketCap")),
+            "name": name,
+            "market_cap": pcap,
             "pe": round(mult["pe"], 2) if mult["pe"] else None,
             "ps": round(mult["ps"], 2) if mult["ps"] else None,
         })
@@ -727,6 +771,7 @@ def get_peers(ticker: str, limit: int = 5) -> dict:
         "peer_median_pe": median([p["pe"] for p in table]),
         "peer_median_ps": median([p["ps"] for p in table]),
         "peers": table,
+        "method": "same industry, nearest market cap (screener-based)",
         "source": "Financial Modeling Prep",
     }
 

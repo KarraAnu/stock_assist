@@ -73,6 +73,7 @@ def get_ownership(ticker: str) -> dict:
                            page=0, limit=100)
             cutoff = (date.today() - timedelta(days=_INSIDER_WINDOW_DAYS)).isoformat()
             buys, sells, transactions = [], [], []
+            strat_buy, strat_sell, strat_count = 0.0, 0.0, 0
             for r in rows if isinstance(rows, list) else []:
                 tdate = str(r.get("transactionDate") or "")
                 ttype = str(r.get("transactionType") or "")
@@ -87,6 +88,18 @@ def get_ownership(ticker: str) -> dict:
                 shares = num(r.get("securitiesTransacted")) or 0
                 price = num(r.get("price")) or 0
                 value = shares * price
+                # 10%-owners are funds/strategic holders distributing — a
+                # different signal from management conviction (dogfooding: a
+                # fund unwind read as "$5.3B of insider selling" on NRG).
+                owner = str(r.get("typeOfOwner") or "").lower()
+                strategic = "10 percent owner" in owner or "10% owner" in owner
+                if strategic:
+                    strat_count += 1
+                    if side == "buy":
+                        strat_buy += value
+                    else:
+                        strat_sell += value
+                    continue
                 (buys if side == "buy" else sells).append(value)
                 transactions.append({
                     "date": tdate, "side": side,
@@ -99,6 +112,9 @@ def get_ownership(ticker: str) -> dict:
             insider = {
                 "available": True,
                 "window_days": _INSIDER_WINDOW_DAYS,
+                "scope": "officers & directors (10%-owner trades reported "
+                         "separately — fund distributions are not management "
+                         "conviction)",
                 "buy_count": len(buys),
                 "sell_count": len(sells),
                 "buy_value": round(sum(buys)),
@@ -106,6 +122,11 @@ def get_ownership(ticker: str) -> dict:
                 "net_value": round(sum(buys) - sum(sells)),
                 "largest_transactions": transactions[:5],
             }
+            if strat_count:
+                insider["strategic_holders_10pct"] = {
+                    "transaction_count": strat_count,
+                    "net_value": round(strat_buy - strat_sell),
+                }
             # Flag the NET position — "insiders bought $115K" is misleading
             # when they also sold $1.9M.
             if buys or sells:

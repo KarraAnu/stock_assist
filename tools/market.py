@@ -18,6 +18,7 @@ from .common import (
     normalize_ticker,
     num,
 )
+from .fmp import FMPError, fmp_get, have_key
 
 
 def get_market_data(ticker: str) -> dict:
@@ -386,6 +387,51 @@ def get_earnings_calendar(ticker: str) -> dict:
     ticker = normalize_ticker(ticker)
     if not ticker:
         return {"error": "no ticker provided"}
+
+    # FMP is the primary source — yfinance's earnings endpoint is slow, flaky,
+    # and served stale past dates in live runs. yfinance remains the fallback.
+    if have_key():
+        try:
+            rows = fmp_get("earnings", symbol=ticker, limit=12)
+        except FMPError:
+            rows = []
+        if isinstance(rows, list) and rows:
+            today_iso = date.today().isoformat()
+            future = sorted(r["date"] for r in rows
+                            if r.get("date") and r["date"] >= today_iso
+                            and r.get("epsActual") is None)
+            past = sorted((r for r in rows
+                           if r.get("date") and r.get("epsActual") is not None),
+                          key=lambda r: r["date"], reverse=True)
+            surprises = []
+            for r in past[:4]:
+                est, act = num(r.get("epsEstimated")), num(r.get("epsActual"))
+                surprises.append({
+                    "date": r["date"],
+                    "eps_estimate": est,
+                    "eps_actual": act,
+                    "surprise_pct": (round((act - est) / abs(est) * 100, 1)
+                                     if (est not in (None, 0) and act is not None)
+                                     else None),
+                })
+            if future or surprises:
+                nd = date.fromisoformat(future[0]) if future else None
+                result = {
+                    "ticker": ticker,
+                    "next_earnings_date": nd.isoformat() if nd else None,
+                    "days_until": (nd - date.today()).days if nd else None,
+                    "recent_surprises": surprises,
+                    "source": "FMP",
+                }
+                if nd is None:
+                    result["note"] = "next date not yet scheduled"
+                elif 0 <= (nd - date.today()).days <= 14:
+                    result["flag"] = (f"earnings in {(nd - date.today()).days} "
+                                      f"days — material event risk; a view "
+                                      f"formed now could be invalidated on "
+                                      f"the report")
+                return result
+
     tk = yf.Ticker(ticker)
     edf = get_earnings_dates_raw(ticker)
 
@@ -482,14 +528,29 @@ def get_dividend_info(ticker: str) -> dict:
         if total_div > 0:
             fcf_coverage = round(fcf / total_div, 2)
 
-    # Cut scan: build annual dividend totals from the payment history.
+    # Cut scan over per-payment history. FMP primary (reliable, adjusted);
+    # yfinance fallback.
     cuts, years_paid = [], None
     try:
-        divs = get_dividends_raw(ticker)
-        if divs is not None and not divs.empty:
-            payments = [(ts, float(amt)) for ts, amt in divs.items() if float(amt) > 0]
-            if payments:
-                years_paid = len({ts.year for ts, _ in payments})
+        payments = None
+        if have_key():
+            try:
+                rows = fmp_get("dividends", symbol=ticker, limit=120)
+                if isinstance(rows, list) and rows:
+                    payments = sorted(
+                        (datetime.fromisoformat(r["date"]),
+                         float(r.get("adjDividend") or r.get("dividend") or 0))
+                        for r in rows if r.get("date"))
+                    payments = [(ts, amt) for ts, amt in payments if amt > 0]
+            except (FMPError, ValueError):
+                payments = None
+        if payments is None:
+            divs = get_dividends_raw(ticker)
+            if divs is not None and not divs.empty:
+                payments = [(ts, float(amt)) for ts, amt in divs.items()
+                            if float(amt) > 0]
+        if payments:
+            years_paid = len({ts.year for ts, _ in payments})
             # Detect cuts at the PER-PAYMENT level: a real cut is when the
             # per-share payment steps down vs the prior one. This is immune to
             # how many ex-dates land in a calendar year (the annual-sum method's

@@ -11,8 +11,9 @@ Facts and deterministic flags only — ranking/judgment stays with the caller.
 
 from __future__ import annotations
 
+import copy
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from .common import data_dir, normalize_ticker, num, parallel_map
 from .filings import get_rpo
@@ -144,6 +145,20 @@ def _analyze_one(ticker: str) -> dict:
     if (fin.get("quarterly") or {}).get("flag"):
         flags.append(fin["quarterly"]["flag"])
 
+    # Recent listings: lockup expiries and thin trading history are
+    # first-order facts (FIG/CBRS/QNT class) the ratios don't show.
+    try:
+        prof = fmp_get("profile", symbol=ticker)
+        ipo = str((prof[0] or {}).get("ipoDate") or "") if prof else ""
+        if ipo:
+            ipo_days = (date.today() - date.fromisoformat(ipo)).days
+            if 0 <= ipo_days < 550:
+                flags.append(f"recent IPO (listed {ipo}) — lockup expiries "
+                             f"and thin history apply; vs-own-history ranges "
+                             f"are weak")
+    except (FMPError, ValueError, TypeError):
+        pass
+
     row = {
         "ticker": ticker,
         "instrument": "stock",
@@ -252,6 +267,12 @@ def _analyze_one(ticker: str) -> dict:
             row["flags"].append(f"contracted backlog (RPO) grew {g:.0f}% YoY "
                                 f"to ${rpo['latest']['usd_m']:,.0f}M — see "
                                 f"get_rpo for the series")
+    elif rpo.get("available") is False:
+        # Absence of the tag is NOT absence of backlog (Cameco has a huge
+        # contract book, just untagged) — make the ambiguity explicit.
+        row["rpo"] = {"available": False,
+                      "note": "total RPO not XBRL-tagged — absence does not "
+                              "mean no backlog; check filings/IR"}
 
     spec = _speculative_scorecard(ticker, md, fin, rpo, own, row)
     if spec:
@@ -283,12 +304,32 @@ def _speculative_scorecard(ticker: str, md: dict, fin: dict, rpo: dict,
     mcap = md.get("market_cap")
     runway = ((fin.get("company_stage") or {}).get("cash_runway")) or {}
     runway_years = runway.get("runway_years")
-    fcf_positive = "positive" in str(runway.get("note", ""))
     components: dict[str, dict] = {}
 
-    # --- funding (0-25): who survives to their milestones ---
-    if fcf_positive:
+    # The score's language assumes tech/growth economics. For commodity
+    # producers "traction" is the commodity price and R&D is irrelevant —
+    # keep the funding/traction math but relabel so a gold miner can't read
+    # as "funded engineering" (IAG scored 67 TRACTION before this gate).
+    sector = md.get("sector") or ""
+    industry = md.get("industry") or ""
+    cyclical_resource = (sector in ("Basic Materials", "Energy")
+                         or any(k in industry for k in
+                                ("Gold", "Silver", "Mining", "Oil", "Coal",
+                                 "Uranium", "Steel")))
+
+    # --- funding (0-25): who survives to their milestones. One positive FY
+    # in a sign-flipping series is not "FCF positive" (FIG scored 25/25 off
+    # exactly that) — full credit needs consistency. ---
+    fcf_series = [r.get("free_cash_flow") for r in rows_fin
+                  if r.get("free_cash_flow") is not None]
+    latest_pos = bool(fcf_series) and fcf_series[0] > 0
+    consistent = (bool(fcf_series)
+                  and sum(1 for f in fcf_series if f >= 0)
+                  >= max(1, len(fcf_series) - 1))
+    if latest_pos and consistent:
         pts = 25
+    elif latest_pos:
+        pts = 18
     elif runway_years is None:
         pts = 0
     elif runway_years >= 5:
@@ -303,7 +344,12 @@ def _speculative_scorecard(ticker: str, md: dict, fin: dict, rpo: dict,
         pts = 0
     components["funding"] = {"points": pts, "max": 25,
                              "runway_years": runway_years,
-                             "fcf_positive": fcf_positive}
+                             "fcf_positive_latest": latest_pos,
+                             "fcf_consistent": consistent}
+    if latest_pos and not consistent:
+        components["funding"]["note"] = ("FCF positive in the latest year but "
+                                         "sign-flipping across the window")
+    fcf_positive = latest_pos
 
     # --- traction (0-30): contracted/realized business vs narrative ---
     rev_now = rows_fin[0].get("revenue") if rows_fin else None
@@ -386,11 +432,16 @@ def _speculative_scorecard(ticker: str, md: dict, fin: dict, rpo: dict,
                                "funded_to_recover": funded}
 
     score = sum(c["points"] for c in components.values())
-    bucket = ("TRACTION-SPEC (funded engineering with contracted traction)"
-              if score >= 60 else
-              "DEVELOPING (some legs, watch the next two quarters)"
-              if score >= 35 else
-              "STORY-SPEC (promotion-shaped — burden of proof on the narrative)")
+    if cyclical_resource:
+        bucket = ("CYCLICAL-RESOURCE (funding/traction read only — revenue "
+                  "tracks commodity prices, not engineering traction; judge "
+                  "on the commodity cycle, costs, and balance sheet)")
+    else:
+        bucket = ("TRACTION-SPEC (funded engineering with contracted traction)"
+                  if score >= 60 else
+                  "DEVELOPING (some legs, watch the next two quarters)"
+                  if score >= 35 else
+                  "STORY-SPEC (promotion-shaped — burden of proof on the narrative)")
 
     # Reverse breakeven: years of growth before today's cap is a normal
     # growth multiple (8x sales) — replaces reverse-DCF where FCF is negative.
@@ -429,7 +480,34 @@ def _speculative_scorecard(ticker: str, md: dict, fin: dict, rpo: dict,
     }
 
 
-def analyze_stocks(tickers) -> dict:
+def _compact_row(row: dict) -> dict:
+    """Trim a scorecard to its decision-relevant core (~40% of the tokens).
+
+    Full 16-name payloads overflow the MCP result limit; the archive keeps
+    the complete row regardless, so nothing is lost — only the response
+    slims down. Flags are kept in full: they ARE the analysis.
+    """
+    r = copy.deepcopy(row)
+    if r.get("instrument") == "fund":
+        r.pop("note", None)
+        return r
+    r.pop("news", None)
+    fin = r.get("financials") or {}
+    fin.pop("fcf_by_year_usd_m", None)
+    fin.pop("revenue_by_quarter_usd_m", None)
+    val = r.get("valuation") or {}
+    val.pop("basis", None)
+    (val.get("vs_peers") or {}).pop("peers", None)
+    sp = r.get("speculative")
+    if sp:
+        r["speculative"] = {"potential_score": sp.get("potential_score"),
+                            "bucket": sp.get("bucket"),
+                            "reverse_breakeven_years":
+                                sp.get("reverse_breakeven_years")}
+    return r
+
+
+def analyze_stocks(tickers, compact: bool = False) -> dict:
     """Full deep battery on a basket of stocks in ONE call (max 20 tickers).
 
     For each ticker this runs, server-side and concurrently, everything the
@@ -450,6 +528,10 @@ def analyze_stocks(tickers) -> dict:
 
     Use screen_stocks first to narrow a wide field cheaply; use this on the
     shortlist. `tickers` may be a list or comma/space-separated string.
+    Baskets over 10 names are automatically returned in compact form (news,
+    year-by-year series, and score components trimmed; the full scorecards
+    are always archived and retrievable via read_snapshot) — pass
+    compact=true to force it for smaller baskets too.
     """
     if isinstance(tickers, str):
         tickers = [t for t in tickers.replace(",", " ").split() if t]
@@ -469,10 +551,12 @@ def analyze_stocks(tickers) -> dict:
     ok = [r for r in results if "error" not in r]
     failed = [r for r in results if "error" in r]
     basket = _basket_relative(ok)
-    _archive_rows(ok)
-    return {
+    _archive_rows(ok)  # archive the FULL rows before any trimming
+
+    compacted = compact or len(seen) > 10
+    out = {
         "count": len(ok),
-        "results": ok,
+        "results": [_compact_row(r) for r in ok] if compacted else ok,
         "basket_medians": basket,
         "failed": failed or None,
         "archived": "scorecards appended to data/snapshots/ (point-in-time "
@@ -480,6 +564,11 @@ def analyze_stocks(tickers) -> dict:
         "note": "objective scorecards only — apply judgment (and WebSearch for "
                 "forward catalysts: backlog, guidance, contracts) before ranking",
     }
+    if compacted:
+        out["compact"] = ("rows trimmed (news/series/score components dropped) "
+                          "— full scorecards archived; read_snapshot(ticker) "
+                          "for any complete row")
+    return out
 
 
 def _basket_relative(rows: list[dict]) -> dict | None:

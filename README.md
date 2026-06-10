@@ -13,7 +13,7 @@ See [HANDOFF.md](HANDOFF.md) for the full design rationale.
 
 | Tool | What it returns |
 |------|-----------------|
-| **`analyze_stocks(tickers)`** | **The batch deep battery (≤20 names, one call):** per name — 3-lens valuation on canonical live-price bases, quality + sector-aware distress composite, multi-year trends + lifecycle stage + quarterly revenue for sub-scale names (lumpiness flag), contracted backlog (RPO via SEC XBRL), risk vs SPY, momentum, dividend safety, earnings proximity, ownership/short interest, top company-specific headlines, and computed gotcha flags. Includes **basket-relative medians** (the basket is the peer group) and, for non-mature names, a **speculative scorecard**: potential score 0–100 (funding / materiality-gated traction / dilution efficiency / R&D intensity / smart money / asymmetry), TRACTION-vs-STORY bucket, reverse-breakeven years, and the judgment inputs the score can't see. Scores are archived with snapshots so decision reviews can test their predictiveness. ETFs get a fund-shaped scorecard. Runs concurrently server-side (~10s cold, <1s warm for 5 names). Every scorecard is archived to `data/snapshots/` (point-in-time record, one per ticker per day). |
+| **`analyze_stocks(tickers)`** | **The batch deep battery (≤20 names, one call):** per name — 3-lens valuation on canonical live-price bases, quality + sector-aware distress composite, multi-year trends + lifecycle stage + quarterly revenue for sub-scale names (lumpiness flag), contracted backlog (RPO via SEC XBRL), risk vs SPY, momentum, dividend safety, earnings proximity, ownership/short interest, top company-specific headlines, and computed gotcha flags. Includes **basket-relative medians** (the basket is the peer group) and, for non-mature names, a **speculative scorecard**: potential score 0–100 (funding / materiality-gated traction / dilution efficiency / R&D intensity / smart money / asymmetry), TRACTION-vs-STORY bucket, reverse-breakeven years, and the judgment inputs the score can't see. Scores are archived with snapshots so decision reviews can test their predictiveness. Cyclical-resource names (miners, oil) get an honest CYCLICAL-RESOURCE bucket instead of engineering-traction language. ETFs get a fund-shaped scorecard. Runs concurrently server-side (~10s cold, <1s warm for 5 names). Baskets >10 names auto-return in **compact** form (full rows always archived); `compact=true` forces it. Every scorecard is archived to `data/snapshots/` (point-in-time record, one per ticker per day). |
 | **`get_rpo(ticker)`** | Remaining performance obligations (contracted backlog) from SEC EDGAR XBRL — latest value, YoY growth, recent series. The decisive commercial metric for early-stage/contract-driven names; a footnote disclosure FMP structurally can't supply. Fails soft for non-taggers. |
 | **`discover_stocks(signal)`** | Signal-first, full-market discovery — no sector needed: `fallen_growth` (40%+ off high, revenue still growing 20%+), `quiet_compounders` (FCF yield + growth + thin coverage), `backlog_inflection` (RPO +50% YoY and material vs cap). Returns candidates with the reason each fired. ~1-3 min cold. |
 | **`expand_theme(theme)`** | Theme → ranked candidates via ETF holdings: matches theme-named funds (from the full 6,100-ETF list, leveraged wrappers excluded), unions their top holdings, ranks by fund count + combined weight. Automates deep-dive Phase 0. |
@@ -21,7 +21,7 @@ See [HANDOFF.md](HANDOFF.md) for the full design rationale.
 | **`read_snapshot(ticker, date=None)`** | Point-in-time recall: the archived scorecard as of a date (or latest), plus available snapshot dates. For decision reviews — separates "data was wrong" from "judgment was wrong". |
 | `get_market_data(ticker)` | Price, market cap, P/E·P/S·P/B (basis-labeled), dividend yield, beta, 52-wk range, margins, growth, cash/debt/FCF, analyst targets, sector, summary. Price cross-checked across two endpoints. Funds are auto-routed to `get_etf_info` instead of erroring. |
 | **`get_etf_info(ticker)`** | ETF/fund profile: AUM, expense ratio, distribution yield, category, top-10 holdings with weights, sector weightings, trailing performance. |
-| **`get_ownership(ticker)`** | Short interest (% float, days-to-cover, MoM change), institutional/insider ownership %, and 6-month open-market insider buy/sell summary with largest transactions *(insider trades need FMP)*. |
+| **`get_ownership(ticker)`** | Short interest (% float, days-to-cover, MoM change), institutional/insider ownership %, and 6-month open-market insider buy/sell summary — **officers/directors only** (10%-owner fund distributions reported separately, since they aren't management conviction) *(insider trades need FMP)*. |
 | `get_indicators(ticker, period="2y")` | RSI(14), SMA 20/50/200, % above SMA50/200, Bollinger position, realized vol (30d & 1y), 1m/3m/6m/1y performance, volume vs 50d avg, plain-language flags. |
 | `get_sec_filings(ticker, filing_type="10-Q", limit=4)` | Recent EDGAR filings: date, accession, primary doc, direct sec.gov URL. Metadata only. |
 | `get_recent_news(ticker, limit=5)` | Headlines deduped and filtered for signal: listicle churn dropped by default (`include_generic=True` to see it), each item tagged company-specific or not. Fails soft. |
@@ -65,10 +65,14 @@ Tools marked *(FMP)* require `FMP_API_KEY` (see setup); without it they return a
   ticker is invalid, data tools return `{"error": ..., "partial": {...}}` rather
   than a deceptively-complete dict of zeros. A missing number is `null` with a
   note, never a fabricated value.
-- **yfinance is the data source for market/indicator/valuation tools.** It
-  scrapes Yahoo Finance and has no SLA — it can be rate-limited or change schema.
-  That's why the healthcheck and the loud-failure contract exist. If results go
-  thin weeks from now, call `healthcheck()` to localize the break.
+- **Source failover (v6).** Daily price history, earnings dates, and dividend
+  history are FMP-primary (paid, SLA-backed) with yfinance fallback — the
+  yfinance history endpoint was the most rate-limited path in the stack and
+  used to blank the risk/momentum layer when throttled. yfinance remains
+  primary for the quote/info snapshot and exclusive for short interest,
+  holder percentages, and fund holdings. Failed/empty fetches are cached for
+  only 60s (negative TTL) so a transient outage isn't pinned for the full
+  cache window. If results go thin, `healthcheck()` localizes the break.
 - **Two data sources, by design.** yfinance (no key) backs the live
   market/indicator/risk tools; **Financial Modeling Prep** (key required) backs
   the fundamentals/quality/valuation/peers/reverse-DCF tools and insider
